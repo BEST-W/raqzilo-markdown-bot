@@ -145,6 +145,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     token = os.getenv('BOT_TOKEN', '').strip()
     if not token:
         raise SystemExit('Missing BOT_TOKEN in environment.')
