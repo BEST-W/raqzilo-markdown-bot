@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: markdown-telegram-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "15"
