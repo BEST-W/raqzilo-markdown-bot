@@ -11,6 +11,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import NetworkError, TimedOut
 
 from converter import ConversionError, SUPPORTED, convert_file, estimate_tokens
 
@@ -82,6 +83,28 @@ def output_name(source: str, mode: str) -> str:
     return f'{stem}{"_compact" if mode == "compact" else ""}.md'
 
 
+async def download_with_retries(attachment, destination: Path) -> None:
+    """Retry transient Telegram network problems while fetching file metadata/data."""
+    for attempt in range(4):
+        try:
+            remote = await attachment.get_file(
+                connect_timeout=25, read_timeout=45, write_timeout=45, pool_timeout=25
+            )
+            await remote.download_to_drive(
+                custom_path=destination,
+                connect_timeout=25, read_timeout=90, write_timeout=45, pool_timeout=25
+            )
+            return
+        except (TimedOut, NetworkError) as exc:
+            if attempt == 3:
+                raise
+            logger.warning(
+                "Temporary Telegram file-transfer error (%s); retry %s/3",
+                type(exc).__name__, attempt + 1
+            )
+            await asyncio.sleep((2, 4, 8)[attempt])
+
+
 async def convert_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not update.effective_chat or update.effective_chat.type != 'private':
@@ -106,8 +129,7 @@ async def convert_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         async with PROCESS_LOCK:
             with tempfile.TemporaryDirectory(prefix='tgmd-') as tmp:
                 incoming = Path(tmp) / ('input' + suffix)
-                remote = await (doc or photo).get_file()
-                await remote.download_to_drive(custom_path=incoming)
+                await download_with_retries(doc or photo, incoming)
                 # CPU/OCR conversion is synchronous; run off the Telegram event loop.
                 result = await asyncio.to_thread(convert_file, incoming, mode, force_ocr)
                 outfile = Path(tmp) / output_name(filename, mode)
@@ -129,6 +151,9 @@ async def convert_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await msg.reply_document(document=fileobj, filename=outfile.name, caption=report[:1000])
     except ConversionError as ex:
         await msg.reply_text('❌ ' + str(ex))
+    except (TimedOut, NetworkError):
+        logger.warning('Telegram transfer failed after four attempts.')
+        await msg.reply_text('❌ لم ينجح تنزيل الملف من تيليجرام بسبب تأخر الاتصال، حتى بعد عدة محاولات. جرّب مرة أخرى لاحقًا.')
     except Exception:
         logger.exception('Failed to handle conversion request')
         await msg.reply_text('❌ حدث خطأ غير متوقع أثناء التحويل. جرّب ملفًا أصغر أو غيّر وضع OCR.')
@@ -145,12 +170,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Avoid logging Telegram API URLs: they contain the BOT_TOKEN.
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
     token = os.getenv('BOT_TOKEN', '').strip()
     if not token:
         raise SystemExit('Missing BOT_TOKEN in environment.')
-    app = Application.builder().token(token).build()
+    app = (Application.builder().token(token)
+           .connect_timeout(25).read_timeout(45).write_timeout(45).pool_timeout(25)
+           .build())
     app.add_handler(CommandHandler(['start', 'help'], start))
     app.add_handler(CommandHandler('mode', mode_command))
     app.add_handler(CommandHandler('ocr', ocr_command))
@@ -169,6 +197,7 @@ def main() -> None:
             listen='0.0.0.0', port=port, url_path='telegram',
             webhook_url=f'{webhook_root}/telegram', secret_token=secret,
             drop_pending_updates=False,
+            bootstrap_retries=5,
         )
     else:
         logger.info('Starting polling mode (local computer)')
