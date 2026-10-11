@@ -1,3 +1,4 @@
+
 """Local document-to-Markdown conversion. No LLM or paid APIs are used.
 
 Improved PDF extraction for 6-panel Arabic handouts, preserving superscripts.
@@ -140,56 +141,227 @@ def _looks_like_six_panel_handout(page: pymupdf.Page) -> bool:
     return (min(bottom_top)-max(top_bottom)) >= .025*h
 
 
-def _six_panel_markdown(page: pymupdf.Page) -> str:
-    """Read separate brochure panels rather than interleave words across columns."""
-    cells={i:[] for i in range(6)}
-    w,h=page.rect.width,page.rect.height
+# Arithmetic-only lines, kept deliberately conservative so words are never
+# silently "corrected" based on a language model or a guessed equation.
+_SIMPLE_MATH = re.compile(r"^[0-9\s×÷+\-^=()]+$")
+_ARABIC_MULTI_NUMBER = re.compile(r"[٠-٩۰-۹]{2,}")
+
+
+def _latin_digits(s: str) -> str:
+    return "".join(str(unicodedata.digit(ch)) if ch.isdigit() else ch for ch in s)
+
+
+def _inline_superscript(line: dict) -> str | None:
+    """Promote only visually confirmed small exponent glyphs in mixed text.
+
+    The glyph stream may list a superscript before the base in RTL PDFs.
+    """
+    spans=line.get('spans',[])
+    if len(spans)<2:
+        return None
+    pairs={}
+    consumed=set()
+    for i,base in enumerate(spans):
+        if len(base['text'])!=1 or not base['text'].isdigit():
+            continue
+        for j,exponent in enumerate(spans):
+            if i==j or j in consumed or i in consumed or j in pairs:
+                continue
+            if len(exponent['text'])!=1 or not exponent['text'].isdigit():
+                continue
+            if not (.45 <= exponent['size']/base['size'] <= .84):
+                continue
+            if abs(exponent['bbox'][0]-base['bbox'][2])>max(2.0,base['size']*.38):
+                continue
+            if exponent['origin'][1]>base['origin'][1]-1.0:
+                continue
+            first=min(i,j)
+            pairs[first]=(_latin_digits(base['text'])+'^'+_latin_digits(exponent['text']))
+            consumed.update((i,j))
+            break
+    if not pairs:
+        return None
+    return ''.join(pairs[i] if i in pairs else ('' if i in consumed else sp['text'])
+                   for i,sp in enumerate(spans))
+
+
+def _infer_reversed_math_digits(page: pymupdf.Page) -> bool:
+    """Infer backwards stored Arabic digits only from checked powers/results.
+
+    For a PDF storing e.g. ٣٢ for printed 32, require a neighboring
+    arithmetic expression that gives 32 before changing prose numbers.
+    """
+    lines = []
     for block in page.get_text('dict')['blocks']:
         if block.get('type') != 0:
             continue
-        x0,y0,x1,y1=block['bbox']
-        c=min(2,max(0,int(((x0+x1)/2)/(w/3))))
-        r=int(((y0+y1)/2)>=h/2)
-        cell=r*3+c
         for line in block['lines']:
-            txt=_math_line(line)
-            if txt is None:
-                txt=''.join(s['text'] for s in line.get('spans', [])).strip()
-            if txt:
-                cells[cell].append((line['bbox'][1],line['bbox'][0],txt))
+            raw = ''.join(sp['text'] for sp in line.get('spans', []))
+            lines.append((line['bbox'][0], line['bbox'][1], raw, _math_line(line) or ''))
+    for x,y,raw,converted in lines:
+        m = re.search(r'([0-9]+)\^([0-9]+)',converted)
+        if not m:
+            continue
+        base, exponent = map(int,m.groups())
+        if base > 99 or exponent > 12:
+            continue
+        expected=base**exponent
+        if expected < 10 or expected > 999999:
+            continue
+        for x2,y2,raw2,converted2 in lines:
+            if not (0 < y2-y < 65 and abs(x2-x) < 200):
+                continue
+            match=re.search(r'[٠-٩۰-۹]{2,}',raw2)
+            if not match or '=' not in raw2:
+                continue
+            glyphs=match.group()
+            forward=int(_latin_digits(glyphs))
+            reverse=int(_latin_digits(glyphs[::-1]))
+            if reverse==expected and forward != expected:
+                return True
+    return False
 
-    def normalize(txt: str) -> str:
-        # Tolerate faulty Arabic font-to-Unicode mappings in this document type.
-        for a,b in [('األ','الأ'),('إىل','إلى'),('عىل','على'),
-                    ('أوˀ','أولًا'),('ثانياًلا','ثانيًا'),('ثالثاًلا','ثالثًا'),
-                    ('عامˁً','عامًا')]:
-            txt=txt.replace(a,b)
-        txt=txt.replace('.','.')
-        txt=re.sub(r'^(العوامل|القوة|الأساس|الأُس|الأسّ|الصيغة الأسية|الصيغة القياسية)\.',r'\1: ',txt)
-        txt=re.sub(r'^=([0-9]+\^[0-9]+)$',r'\1 =',txt)
-        txt=re.sub(r'^=([0-9]+)$',r'= \1',txt)
-        return txt
-    pieces=[]
-    for seq,idx in enumerate([2,1,0,5,4,3],start=1):
-        pieces.append(f'## القسم {seq}')
-        ordered=sorted(cells[idx],key=lambda q:(q[0],-q[1]))
-        groups=[]
-        for y,x,txt in ordered:
-            if groups and abs(y-groups[-1][0])<=6.5:
-                groups[-1][1].append((x,txt))
-            else:
-                groups.append([y,[(x,txt)]])
-        last_y=None
-        for y,frags in groups:
-            if last_y is not None and y-last_y>28:
-                pieces.append('')
-            frags.sort(key=lambda it:-it[0])
-            txt=' '.join(part for _,part in frags)
-            txt=normalize(txt)
-            pieces.append(txt)
-            last_y=y
-        pieces.append('')
-    return '\n'.join(pieces)
+
+def _normalize_arabic_line(text: str, *, reverse_multidigit: bool = False) -> str:
+    # Correct only well-known PDF glyph-order and Unicode mapping artifacts.
+    for old,new in (('األ','الأ'), ('إىل','إلى'),('عىل','على'),
+                    ('ثانياًلا','ثانيًا'),('ثالثاًلا','ثالثًا'),('أوˀ','أولًا'),
+                    ('مالحظة','ملاحظة'), ('أُأسّ','أُسّ'),('عامˁً','عامًا')):
+        text=text.replace(old,new)
+    if reverse_multidigit:
+        text=_ARABIC_MULTI_NUMBER.sub(lambda m:_latin_digits(m.group()[::-1]), text)
+    # RTL punctuation regularly arrives on the opposite end of a line.
+    if text.lstrip().startswith('.') and re.search(r'[ء-ي]',text):
+        text=text.lstrip()[1:].strip()+'.'
+    if text.lstrip().startswith(':') and re.search(r'[ء-ي]',text):
+        text=text.lstrip()[1:].strip()+':'
+    # A combining mark separated from its base by PDF glyph reordering is not a valid prefix.
+    text=re.sub(r'(?<=\s)[\u064b-\u0652]+(?=[ء-ي])','',text)
+    text=re.sub(r'([ء-ي][ًٌٍ])\s+(?=ا)',r'\1',text)
+    text=re.sub(r'\s+([.,:])',r'\1',text)
+    text=re.sub(r'^([ء-ي\s]{3,25})\.\s*(?=[ء-يً-ْ])',r'\1: ',text)
+    text=re.sub(r'(\^[0-9]+):\s+هكذا',r'\1 هكذا:',text)
+    text=re.sub(r'^\)مثال \(([٠-٩0-9]+)$',r'مثال (\1)',text)
+    text=re.sub(r'([.:])\s*(?=\S)',r'\1 ',text)
+    return text.strip()
+
+
+def _merge_arithmetic_lines(lines: list[str]) -> list[str]:
+    """Join vertically separated equations, never interpolate missing values."""
+    out=[]
+    for item in lines:
+        s=item.strip()
+        if _SIMPLE_MATH.fullmatch(s):
+            s=re.sub(r'=(?=[0-9])','= ',s)
+            item=s
+        if s and out and not out[-1] and len(out)>1 and _SIMPLE_MATH.fullmatch(s) and _SIMPLE_MATH.fullmatch(out[-2]):
+            if s.startswith('=') and '^' in out[-2]:
+                out.pop()
+        if s and out and out[-1] and _SIMPLE_MATH.fullmatch(s) and _SIMPLE_MATH.fullmatch(out[-1]):
+            last=out[-1].strip()
+            if last.count('×') >= 1 and (s.endswith('=') or s.startswith('=')) and '^' in s:
+                power=s.rstrip('=').lstrip('=').strip()
+                out[-1]=last+' = '+power
+                continue
+            if '^' in last and s.startswith('=') and last.count('=') == 0:
+                out[-1]=last+' '+s
+                continue
+            if s.startswith('=') and '=' in last and not last.endswith('='):
+                out[-1]=last+' '+s
+                continue
+        out.append(item)
+    return out
+
+
+def _panel_lines_to_markdown(cell: list[tuple], *, reverse_multidigit: bool) -> list[str]:
+    """Stable top-to-bottom grouping, respecting compact definition rows."""
+    records=sorted(cell,key=lambda z:(z[0],-z[1]))
+    groups=[]
+    for y,x,txt,size in records:
+        if groups and y - groups[-1]['end'] <= 9.5 and y - groups[-1]['start'] < 18:
+            # Merge only when headings or brief fragments share a print row.
+            items=groups[-1]['items']
+            share_y=abs(y - groups[-1]['start']) <= 6.5
+            bold_heading=any(z[3] >= size*1.06 and z[1] > x for z in items)
+            is_short=len(txt.strip())<=25
+            bold_incoming=(is_short and size>=max(z[3] for z in items)*1.04
+                           and x>max(z[1] for z in items)+25)
+            if share_y or (is_short and bold_heading) or bold_incoming:
+                items.append((y,x,txt,size))
+                groups[-1]['end']=y
+                continue
+        groups.append({'start':y,'end':y,'items':[(y,x,txt,size)]})
+    result=[]
+    prior=None
+    for group in groups:
+        items=group['items']
+        if prior is not None and group['start']-prior>28:
+            result.append('')
+        # When a bold right-hand label has a wrapped left-hand description,
+        # label first, then continuation in vertical order.
+        heading=max(items,key=lambda q:(q[1],q[3]))
+        definition_row=(len(items)>=2 and heading[3]>=max(8.0,min(q[3] for q in items)*1.06)
+                        and heading[1]>max(q[1] for q in items if q is not heading)+18
+                        and len(heading[2])<=25)
+        if definition_row:
+            children=[heading]+sorted((q for q in items if q is not heading),key=lambda q:(q[0],-q[1]))
+        else:
+            children=sorted(items,key=lambda q:-q[1])
+        parts=[z[2] for z in children]
+        if definition_row:
+            label=parts[0].strip().lstrip('ّ')
+            parts[0]=label.rstrip(': .')+': '
+            parts[1:]=[s.lstrip(' .') for s in parts[1:]]
+        elif parts and parts[0].lstrip().startswith(':') and len(parts)>1:
+            parts[0]=parts[0].lstrip().lstrip(':').strip()+':'
+        value=' '.join(parts)
+        # Single-line PDF table headings sometimes carry the separator as the
+        # first character of their right-to-left definition text.
+        if len(items)>=2 and not definition_row:
+            value=re.sub(r'^([^.:]{3,25})\.\s+(?=[ء-ي])',r'\1: ',value)
+        value=_normalize_arabic_line(value,reverse_multidigit=reverse_multidigit)
+        result.append(value)
+        prior=group['start']
+    return _merge_arithmetic_lines(result)
+
+
+def _six_panel_markdown(page: pymupdf.Page) -> str:
+    """Use physical panels and glyph positions rather than plain line order."""
+    w,h=page.rect.width,page.rect.height
+    cells={i:[] for i in range(6)}
+    reverse_math_numbers=_infer_reversed_math_digits(page)
+    for block in page.get_text('dict')['blocks']:
+        if block.get('type')!=0:
+            continue
+        xc=(block['bbox'][0]+block['bbox'][2])/2
+        yc=(block['bbox'][1]+block['bbox'][3])/2
+        c=min(2,max(0,int(xc/(w/3))))
+        r=int(yc>=h/2)
+        for line in block['lines']:
+            text=_math_line(line)
+            if text is None:
+                text=_inline_superscript(line)
+            if text is None:
+                text=''.join(sp['text'] for sp in line.get('spans',[])).strip()
+            if text:
+                y=line['bbox'][1]
+                x=line['bbox'][0]
+                size=max((sp['size'] for sp in line['spans']),default=9)
+                cells[r*3+c].append((y,x,text,size))
+    output=[]
+    for n,panel_id in enumerate((2,1,0,5,4,3),1):
+        output.append(f'## القسم {n}')
+        content=_panel_lines_to_markdown(cells[panel_id],reverse_multidigit=reverse_math_numbers)
+        # Remove print fold/page labels, not meaningful lesson content.
+        if reverse_math_numbers:
+            content=[t for t in content if not re.fullmatch(r'[٠-٩0-9]\s*/\s*[٠-٩0-9]',t)]
+        if n==1:
+            content=[re.sub(r'^(الدرس)\s+([٠-٩0-9]+)[–-]([٠-٩0-9]+)$',
+                            lambda m:f'{m.group(1)} {_latin_digits(m.group(3))}–{_latin_digits(m.group(2))}',t)
+                     for t in content]
+        output.extend(content)
+        output.append('')
+    return '\n'.join(output)
 
 
 def _pixmap_image(page) -> Image.Image:
@@ -228,6 +400,8 @@ def _pdf(path: Path, *,force_ocr: bool) -> tuple[str,list[str]]:
             if count==1 and not force_ocr and _looks_like_six_panel_handout(doc[0]):
                 text=_six_panel_markdown(doc[0])
                 warnings.append('تم تقسيم المطوية إلى ستة أقسام بحسب مواضعها، وتحليل الأسس من حجم الحروف. راجع الصيغ المعقدة.')
+                if re.search(r'(?m)^\s*[٠-٩0-9]\s+[٠-٩0-9]\s*$', text):
+                    warnings.append('توجد أرقام منفصلة في رسومات توضيحية؛ راجع موضع الأساس والأس في PDF الأصلي.')
                 return text, warnings
         try:
             import pymupdf4llm
