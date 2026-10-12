@@ -1,7 +1,6 @@
-
 """Local document-to-Markdown conversion. No LLM or paid APIs are used.
 
-Improved PDF extraction for 6-panel Arabic handouts, preserving superscripts.
+V4: structured Arabic/PDF extraction, power diagrams, and math validation.
 """
 from __future__ import annotations
 
@@ -226,7 +225,8 @@ def _normalize_arabic_line(text: str, *, reverse_multidigit: bool = False) -> st
     # Correct only well-known PDF glyph-order and Unicode mapping artifacts.
     for old,new in (('األ','الأ'), ('إىل','إلى'),('عىل','على'),
                     ('ثانياًلا','ثانيًا'),('ثالثاًلا','ثالثًا'),('أوˀ','أولًا'),
-                    ('مالحظة','ملاحظة'), ('أُأسّ','أُسّ'),('عامˁً','عامًا')):
+                    ('مالحظة','ملاحظة'), ('أُأسّ','أُسّ'),
+                    ('عامˁً','عاملاً'),('عامˁ','عامل'), ('بدالً','بدلاً')):
         text=text.replace(old,new)
     if reverse_multidigit:
         text=_ARABIC_MULTI_NUMBER.sub(lambda m:_latin_digits(m.group()[::-1]), text)
@@ -236,9 +236,11 @@ def _normalize_arabic_line(text: str, *, reverse_multidigit: bool = False) -> st
     if text.lstrip().startswith(':') and re.search(r'[ء-ي]',text):
         text=text.lstrip()[1:].strip()+':'
     # A combining mark separated from its base by PDF glyph reordering is not a valid prefix.
-    text=re.sub(r'(?<=\s)[\u064b-\u0652]+(?=[ء-ي])','',text)
+    text=re.sub(r'(?<![ء-ي])[\u064b-\u0652]+(?=[ء-ي])','',text)
+    text=re.sub(r'([ء-ي][\u064b-\u0652]{1,3})\s+ا(?=\b)',r'\1ا',text)
+    text=text.replace('وال نضرب','ولا نضرب')
     text=re.sub(r'([ء-ي][ًٌٍ])\s+(?=ا)',r'\1',text)
-    text=re.sub(r'\s+([.,:])',r'\1',text)
+    text=re.sub(r'\s+([.,:،؛])',r'\1',text)
     text=re.sub(r'^([ء-ي\s]{3,25})\.\s*(?=[ء-يً-ْ])',r'\1: ',text)
     text=re.sub(r'(\^[0-9]+):\s+هكذا',r'\1 هكذا:',text)
     text=re.sub(r'^\)مثال \(([٠-٩0-9]+)$',r'مثال (\1)',text)
@@ -325,6 +327,87 @@ def _panel_lines_to_markdown(cell: list[tuple], *, reverse_multidigit: bool) -> 
     return _merge_arithmetic_lines(result)
 
 
+
+
+def _reconstruct_power_parts(lines: list[str]) -> list[str]:
+    """Match a base/exponent diagram with its two labels, including spacing rows.
+
+    Only uses values actually printed above the matching labeled boxes.
+    """
+    output=[]
+    i=0
+    pattern = re.compile(r'^[٠-٩۰-۹0-9]\s+[٠-٩۰-۹0-9]$')
+    labels = re.compile(r'^الأساس\s*:\s*(.+?)\s+الأسّ\s*:\s*(.+)$')
+    while i < len(lines):
+        if pattern.fullmatch(lines[i].strip()):
+            j=i+1
+            while j<len(lines) and not lines[j].strip() and j-i<=2:
+                j+=1
+            if j<len(lines) and j-i<=3:
+                match=labels.fullmatch(lines[j].strip())
+                if match:
+                    a,b=lines[i].split()
+                    output.append(f'الأساس: {_latin_digits(a)} — {match.group(1)}')
+                    output.append(f'الأسّ: {_latin_digits(b)} — {match.group(2)}')
+                    i=j+1
+                    continue
+        output.append(lines[i]);i+=1
+    return output
+
+
+def _merge_arabic_wrapped_lines(lines: list[str]) -> list[str]:
+    """Join obvious long text wraps without merging headings, math, or list labels."""
+    out=[]
+    for original in lines:
+        current=original.strip()
+        if not current:
+            out.append(original)
+            continue
+        previous=out[-1].strip() if out else ''
+        if (previous and len(previous)>=40 and len(current)<=35
+                and not previous.endswith(('.', '!', '?', '؟', ':', '؛'))
+                and not previous.startswith('#')
+                and not current.startswith(('#','|','- ', '* '))
+                and not _SIMPLE_MATH.fullmatch(previous)
+                and not _SIMPLE_MATH.fullmatch(current)
+                and not re.match(r'^(?:[0-9٠-٩]+\s*[:.)-]|مثال\s*\()', current)):
+            out[-1] = out[-1].rstrip()+' '+current
+        else:
+            out.append(original)
+    return out
+
+
+def _check_math_equations(markdown: str) -> list[str]:
+    """Detect numerical contradictions; never auto-supply guessed answers."""
+    problems=[]
+    for line_no,line in enumerate(markdown.splitlines(),1):
+        if '=' not in line or ('^' not in line and '×' not in line):
+            continue
+        parts=[p.strip() for p in line.split('=')]
+        if len(parts)<2 or any(not p for p in parts):
+            continue
+        results=[]
+        for expr in parts:
+            if re.fullmatch(r'\d{1,8}\^\d{1,3}',expr):
+                a,b=(int(x) for x in expr.split('^'))
+                if b>20:break
+                results.append(a**b)
+            elif re.fullmatch(r'\d{1,8}(?:\s*×\s*\d{1,8})+',expr):
+                val=1
+                for t in re.split(r'\s*×\s*',expr):
+                    val*=int(t)
+                results.append(val)
+            elif re.fullmatch(r'\d{1,15}',expr):
+                results.append(int(expr))
+            else:
+                break
+        else:
+            if len(results)==len(parts) and len(set(results))>1:
+                problems.append(f'السطر {line_no}: معادلة غير متطابقة رياضيًا؛ راجع PDF الأصلي.')
+                if len(problems)>=3:
+                    break
+    return problems
+
 def _six_panel_markdown(page: pymupdf.Page) -> str:
     """Use physical panels and glyph positions rather than plain line order."""
     w,h=page.rect.width,page.rect.height
@@ -359,6 +442,8 @@ def _six_panel_markdown(page: pymupdf.Page) -> str:
             content=[re.sub(r'^(الدرس)\s+([٠-٩0-9]+)[–-]([٠-٩0-9]+)$',
                             lambda m:f'{m.group(1)} {_latin_digits(m.group(3))}–{_latin_digits(m.group(2))}',t)
                      for t in content]
+        content=_reconstruct_power_parts(content)
+        content=_merge_arabic_wrapped_lines(content)
         output.extend(content)
         output.append('')
     return '\n'.join(output)
@@ -561,6 +646,8 @@ def convert_file(path: str|Path,mode: str='faithful',force_ocr: bool=False) -> C
     out=clean_compact(raw) if mode=='compact' else raw
     if len(out)>MAX_OUTPUT_CHARS:
         raise ConversionError('الناتج كبير جدًا؛ قسّم الملف إلى أجزاء أصغر.')
+    if suffix == '.pdf':
+        warnings.extend(_check_math_equations(out))
     return ConversionResult(markdown=out,raw_markdown=raw,warnings=warnings)
 
 
